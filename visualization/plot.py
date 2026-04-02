@@ -51,6 +51,8 @@ def calculate_flight_metrics(df):
 
     # ДИСТАНЦІЯ 
     step_h = calculate_haversine_distance(df['lat'], df['lon']).fillna(0)
+    step_h = step_h.mask(step_h > 100, 0)
+    
     step_z = df['z'].diff().fillna(0)
     step_3d = np.sqrt(step_h**2 + step_z**2)
     m['total_dist'] = step_3d.sum()
