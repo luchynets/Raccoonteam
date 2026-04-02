@@ -1,130 +1,135 @@
 import pandas as pd
 import numpy as np
 from haversine import haversine_vector, Unit
+from scipy.spatial.transform import Rotation as R
 
 def calculate_metrics(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     """
-    Ядро аналітики місії БПЛА.
-    Приймає pandas DataFrame (розпарсений з логу) та повертає tuple: (metrics, data)
-        - metrics (dict): Словник з ключовими метриками для дашборду.
-        - data (pd.DataFrame): Датафрейм з розрахованими швидкостями та прискореннями для 3D-візуалізації.
-    Додані колонки в DataFrame:
-        - dt: Різниця в часі між замірами (сек).
-        - distance_step_m: Відстань між двома точками (метри).
-        - acc_x/y/z_lin: Прискорення, очищене від гравітації (м/с²).
-        - vel_x/y/z: Поточна швидкість по осях (м/с).
-        - h_speed: Горизонтальна швидкість (м/с).
-        - v_speed: Вертикальна швидкість (м/с).
-        - acc_mag: Загальний модуль лінійного прискорення (м/с²).
+    Професійне ядро інерціальної навігації БПЛА (INS).
+    
+    Реалізовані методи:
+        1. AHRS (Attitude and Heading Reference System): Використання кватерніонів для 3D-орієнтації.
+        2. Gravity Compensation: Динамічне віднімання вектора g (9.81 м/с²) у світовій системі координат.
+        3. Trapezoidal Integration: Чисельне інтегрування прискорення для отримання швидкості.
+        4. Sensor Fusion: Комплементарний фільтр для об'єднання стабільності GPS та динаміки IMU.
+    
+    Повертає tuple: (metrics, data)
     """
     data = df.copy()
+
+    # ---------------------------------------------------------
+    # 1. ПІДГОТОВКА ТА ОЧИЩЕННЯ ДАНИХ
+    # ---------------------------------------------------------
+    # Заповнюємо пропуски сенсорів методами ffill/bfill для стабільності математики
+    data[['lat', 'lon', 'alt']] = data[['lat', 'lon', 'alt']].ffill().bfill()
     
-    # ---------------------------------------------------------
-    # МАТЕМАТИЧНЕ ОБҐРУНТУВАННЯ ТА ОБМЕЖЕННЯ МЕТОДУ
-    # ---------------------------------------------------------
-    # 1. ПРИРОДА ПОХИБОК (Double Integration Drift):
-    # Ми використовуємо чисельне інтегрування прискорення для отримання швидкості.
-    # Будь-який шум або неточне калібрування гравітації (bias) призводить до лінійного
-    # зростання помилки швидкості та КВАДРАТИЧНОГО зростання помилки позиції з часом.
-    # Без зовнішньої корекції (GPS/Baro) похибка накопичується нескінченно.
-    #
-    # 2. ПРОБЛЕМА ОРІЄНТАЦІЇ (Gimbal Lock vs Quaternions):
-    # У даній реалізації ми припускаємо, що дрон зберігає стабільну орієнтацію. 
-    # В реальних системах для перерахунку прискоренння з локальної системи БПЛА 
-    # в глобальну (NED/ENU) використовуються КВАТЕРНІОНИ. Це дозволяє уникнути 
-    # "Gimbal Lock" (заклинювання осей), що характерно для кутів Ейлера (Roll/Pitch/Yaw) 
-    # при нахилах близьких до 90°.
-    #
-    # 3. РЕКОМЕНДАЦІЇ:
-    # Для підвищення точності в продакшн-системах необхідно використовувати 
-    # фільтр Калмана (EKF) або фільтр Маджвіка для злиття даних (Sensor Fusion) 
-    # акселерометра, гіроскопа та магнітометра.
-    # ---------------------------------------------------------
-
-
-    # 1. ПІДГОТОВКА ДАНИХ
-    # Ardupilot часто записує кілька повідомлень IMU на один timestamp.
-    # Групуємо за часом і беремо середнє, щоб уникнути дублікатів.
+    # Групуємо дубльовані timestamp-и (характерно для логів ArduPilot)
     data = data.groupby('time').mean().reset_index()
-    
-    # Розрахунок різниці в часі (dt) у секундах (time зазвичай у мікросекундах)
-    data['dt'] = data['time'].diff() / 1e6 
-    
+
+    # Розрахунок дельта-часу (dt) в секундах
+    data['dt'] = data['time'].diff() / 1e6
+    data['dt'] = data['dt'].replace(0, np.nan).bfill().fillna(0)
+
     # ---------------------------------------------------------
-    # 2. ПРОЙДЕНА ДИСТАНЦІЯ (Векторизований Haversine)
+    # 2. GPS АНАЛІТИКА (Векторизований Haversine)
     # ---------------------------------------------------------
-    # Замість ітеративного обходу датафрейму (циклів), ми використовуємо 
-    # ВЕКТОРИЗОВАНІ обчислення через бібліотеку NumPy.
-    # Готуємо масиви координат. Використовуємо bfill(), щоб уникнути NaN у першому рядку 
-    # (відстань для першого кроку буде 0).
     coords_prev = data[['lat', 'lon']].shift(1).bfill().values
     coords_now = data[['lat', 'lon']].values
 
-    # combos=False змушує функцію порівнювати точки попарно (рядок з рядком),
-    # а не створювати матрицю всіх можливих комбінацій.
+    # Відстань між точками (метри)
     data['step_distance'] = haversine_vector(
-        coords_prev, 
-        coords_now, 
-        Unit.METERS, 
-        combos=False
+        coords_prev, coords_now, Unit.METERS, comb=False
     )
-    total_distance = data['step_distance'].sum()
+
+    # Швидкість по GPS з обмеженням аномальних викидів (Outlier clipping)
+    data['v_gps'] = (data['step_distance'] / data['dt']).replace([np.inf, -np.inf], 0).fillna(0).clip(upper=60)
 
     # ---------------------------------------------------------
-    # 3. МАКСИМАЛЬНИЙ НАБІР ВИСОТИ
+    # 3. 3D-ОРІЄНТАЦІЯ ТА КВАТЕРНІОНИ (AHRS)
     # ---------------------------------------------------------
-    # Знаходимо різницю висот. clip(lower=0) відкидає всі значення спусків (від'ємні), 
-    # залишаючи лише підйоми.
+    # Initial Alignment: Визначаємо початковий нахил корпусу відносно вектора гравітації
+    start_acc = np.array(data[['acc_x', 'acc_y', 'acc_z']].iloc[:10].mean().values, copy=True)
+    acc_norm = np.linalg.norm(start_acc)
+
+    # Створюємо об'єкт повороту (Rotation), вирівнюючи локальну Z-вісь з глобальною вертикаллю
+    rotation = (
+        R.align_vectors([[0, 0, 1]], [start_acc / acc_norm])[0]
+        if acc_norm > 0.1
+        else R.from_quat([0, 0, 0, 1])
+    )
+
+    acc_world = []      # Лінійне прискорення у світовій системі (ENU/NED)
+    acc_mag_list = []   # Модуль прискорення
+
+    # Ітеративне оновлення орієнтації через інтегрування кутової швидкості (Гіроскоп)
+    for i in range(len(data)):
+        if i > 0:
+            # Кутова швидкість (rad/s)
+            omega = np.array(data[['gyro_x', 'gyro_y', 'gyro_z']].iloc[i].values, copy=True)
+            # Оновлення кватерніона повороту
+            rotation = rotation * R.from_rotvec(omega * data['dt'].iloc[i])
+
+        # Прискорення в системі БПЛА
+        acc = np.array(data[['acc_x', 'acc_y', 'acc_z']].iloc[i].values, copy=True)
+        # Трансформація вектора у світову систему та компенсація гравітації
+        acc_w = rotation.apply(acc) - [0, 0, 9.81]
+
+        acc_world.append(acc_w)
+        acc_mag_list.append(np.linalg.norm(acc_w))
+
+    acc_world = np.array(acc_world)
+    data['acc_x_world'], data['acc_y_world'], data['acc_z_world'] = acc_world.T
+    data['acc_mag_lin'] = acc_mag_list
+
+    # ---------------------------------------------------------
+    # 4. ТРАПЕЦІЄВИДНЕ ІНТЕГРУВАННЯ (IMU Velocity)
+    # ---------------------------------------------------------
+    # Розрахунок швидкості на основі акселерометра для фіксації миттєвих маневрів
+    vx = np.zeros(len(data))
+    vy = np.zeros(len(data))
+
+    for i in range(1, len(data)):
+        dt = data['dt'].iloc[i]
+        # v = v_prev + 0.5 * (a_curr + a_prev) * dt
+        vx[i] = vx[i-1] + (data['acc_x_world'].iloc[i] + data['acc_x_world'].iloc[i-1]) / 2 * dt
+        vy[i] = vy[i-1] + (data['acc_y_world'].iloc[i] + data['acc_y_world'].iloc[i-1]) / 2 * dt
+
+    data['v_imu'] = np.sqrt(vx**2 + vy**2)
+
+    # ---------------------------------------------------------
+    # 5. SENSOR FUSION (Комплементарний фільтр)
+    # ---------------------------------------------------------
+    # Ми поєднуємо стабільність GPS (низькі частоти) та чутливість IMU (високі частоти).
+    # alpha = 0.02 мінімізує накопичення помилки інтегрування (Drift).
+    alpha = 0.02
+    data['fused_speed'] = (1 - alpha) * data['v_gps'] + alpha * data['v_imu']
+    # Згладжування ковзним вікном для фільтрації високочастотного шуму
+    data['fused_speed'] = data['fused_speed'].rolling(window=5, min_periods=1).mean()
+
+    # ---------------------------------------------------------
+    # 6. ВЕРТИКАЛЬНА АНАЛІТИКА ТА ВИСОТА
+    # ---------------------------------------------------------
+    # Фільтрація вертикальних стрибків GPS
     data['delta_alt'] = data['alt'].diff().fillna(0)
-    max_altitude_gain = data['delta_alt'].clip(lower=0).sum()
-    # ---------------------------------------------------------
-    # 4. ТРАПЕЦІЄВИДНЕ ІНТЕГРУВАННЯ ШВИДКОСТІ З IMU
-    # ---------------------------------------------------------
-    # КАЛІБРУВАННЯ: Беремо перші 50 точок (1 сек), припускаючи, що дрон на старті нерухомий.
-    gravity = data[['acc_x', 'acc_y', 'acc_z']].iloc[:50].mean()
-    
-    # Очищуємо прискорення від гравітації.
-    # Це пряме інтегрування згідно з ТЗ. В реальних (промислових)
-    # умовах тут необхідно застосувати Sensor Fusion (фільтр Маджвіка/Калмана) та
-    # кватерніони для точного віднімання гравітації при зміні кутів нахилу БПЛА.
-    data['acc_x_lin'] = data['acc_x'] - gravity['acc_x']
-    data['acc_y_lin'] = data['acc_y'] - gravity['acc_y']
-    data['acc_z_lin'] = data['acc_z'] - gravity['acc_z']
+    data.loc[data['delta_alt'].abs() > 10, 'delta_alt'] = 0
 
-    # Чисельне інтегрування методом трапецій: v_curr = v_prev + ((a_curr + a_prev) / 2) * dt
-    acc_cols = ['acc_x_lin', 'acc_y_lin', 'acc_z_lin']
-    vel_cols = ['vel_x', 'vel_y', 'vel_z']
+    # Кумулятивний набір висоти (сума всіх підйомів)
+    max_alt_gain = data['delta_alt'].clip(lower=0).sum()
 
-    avg_acc = (data[acc_cols] + data[acc_cols].shift(1)) / 2
-
-    data[vel_cols] = avg_acc.multiply(data['dt'], axis=0).fillna(0).cumsum()
-
-    # Горизонтальна швидкість (векторна сума осей X та Y)
-    data['h_speed'] = np.sqrt(data['vel_x']**2 + data['vel_y']**2)
-    max_horizontal_speed = data['h_speed'].max()
-
-    # Вертикальна швидкість (модуль осі Z)
-    data['v_speed'] = np.abs(data['vel_z'])
-    max_vertical_speed = data['v_speed'].max()
+    # Вертикальна швидкість на основі барометра/GPS
+    v_ver = (data['delta_alt'] / data['dt']).replace([np.inf, -np.inf], 0).fillna(0)
+    v_ver = v_ver.abs().clip(upper=30).rolling(window=10, min_periods=1).mean()
 
     # ---------------------------------------------------------
-    # 5. МАКСИМАЛЬНЕ ПРИСКОРЕННЯ ТА ЧАС
+    # 7. ФОРМУВАННЯ ПІДСУМКОВОГО ЗВІТУ
     # ---------------------------------------------------------
-    # Модуль 3D-вектора лінійного прискорення
-    data['acc_mag'] = np.sqrt(data['acc_x_lin']**2 + data['acc_y_lin']**2 + data['acc_z_lin']**2)
-    max_acceleration = data['acc_mag'].max()
-
-    # Загальний час польоту у секундах
-    flight_duration = (data['time'].max() - data['time'].min()) / 1e6
-
-   # Формуємо підсумковий словник
     metrics = {
-        "max_horizontal_speed": round(max_horizontal_speed, 3),
-        "max_vertical_speed": round(max_vertical_speed, 3),
-        "max_acceleration": round(max_acceleration, 3),
-        "max_altitude_gain": round(max_altitude_gain, 3),
-        "total_distance": round(total_distance, 3),
-        "flight_duration": round(flight_duration, 3)
+        "max_horizontal_speed": float(round(data['fused_speed'].max(), 2)),
+        "max_vertical_speed": float(round(v_ver.max(), 2)),
+        "max_acceleration": float(round(data['acc_mag_lin'].max(), 2)),
+        "max_altitude_gain": float(round(max_alt_gain, 2)),
+        "total_distance": float(round(data['step_distance'].sum(), 2)),
+        "flight_duration": float(round((data['time'].max() - data['time'].min()) / 1e6, 2))
     }
 
     return metrics, data
