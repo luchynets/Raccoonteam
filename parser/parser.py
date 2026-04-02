@@ -96,6 +96,84 @@ class TelemetryProcessor:
             on="time"
         )
 
+import numpy as np
+
+class UnitAutoDetector:
+
+    # ---------------- GPS ----------------
+    @staticmethod
+    def detect_gps(df):
+        units = {}
+
+        if df.empty:
+            return df, units
+
+        # LAT/LON
+        if "lat" in df:
+            max_val = df["lat"].abs().max()
+
+            if max_val > 1e6:
+                # deg * 1e7
+                df["lat"] = df["lat"] / 1e7
+                units["lat"] = "deg"
+            else:
+                units["lat"] = "deg"
+
+        if "lon" in df:
+            max_val = df["lon"].abs().max()
+
+            if max_val > 1e6:
+                df["lon"] = df["lon"] / 1e7
+                units["lon"] = "deg"
+            else:
+                units["lon"] = "deg"
+
+        # ALT
+        if "alt" in df:
+            max_val = df["alt"].abs().max()
+
+            if max_val > 10000:
+                df["alt"] = df["alt"] / 1000
+                units["alt"] = "m"
+            else:
+                units["alt"] = "m"
+
+        return df, units
+
+    # ---------------- IMU ----------------
+    @staticmethod
+    def detect_imu(df):
+        units = {}
+
+        if df.empty:
+            return df, units
+
+        # ACCELERATION
+        for axis in ["acc_x", "acc_y", "acc_z"]:
+            if axis in df:
+                max_val = df[axis].abs().max()
+
+                if max_val > 100:  
+                    # швидше за все mg або raw
+                    df[axis] = df[axis] / 1000  # mg -> g
+                    df[axis] = df[axis] * 9.80665
+                    units[axis] = "m/s^2"
+                else:
+                    units[axis] = "m/s^2"
+
+        # GYRO
+        for axis in ["gyro_x", "gyro_y", "gyro_z"]:
+            if axis in df:
+                max_val = df[axis].abs().max()
+
+                if max_val > 50:  
+                    # deg/s -> rad/s
+                    df[axis] = np.deg2rad(df[axis])
+                    units[axis] = "rad/s"
+                else:
+                    units[axis] = "rad/s"
+
+        return df, units
 
 def main():
     parser = argparse.ArgumentParser(description="Telemetry Parser")
@@ -110,7 +188,11 @@ def main():
 
     gps_df, imu_df = tp.to_dataframe()
 
-    gps_df, imu_df = TelemetryProcessor.normalize_units(gps_df, imu_df)
+    gps_df, gps_units = UnitAutoDetector.detect_gps(gps_df)
+    imu_df, imu_units = UnitAutoDetector.detect_imu(imu_df)
+
+    print("GPS units:", gps_units)
+    print("IMU units:", imu_units)
 
     gps_freq = TelemetryProcessor.compute_frequency(gps_df)
     imu_freq = TelemetryProcessor.compute_frequency(imu_df)
