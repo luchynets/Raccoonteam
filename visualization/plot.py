@@ -1,213 +1,234 @@
+import os
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import os
-import pymap3d as pm  # ДОДАНО: Бібліотека для точного перетворення координат WGS84 -> ENU
+import pymap3d as pm
 
-# ==========================================
-# ЯДРО АНАЛІТИКИ (АЛГОРИТМІЧНА БАЗА)
-# ==========================================
-
+# АНАЛІТИЧНЕ ЯДРО 
 def calculate_haversine_distance(lat, lon):
     """
-    Обчислення пройденої дистанції за формулою Haversine (вимога хакатону).
-    Вхідні дані: масиви широт та довгот (в градусах).
+    Обчислення відстані Haversine. 
+    Рахує реальний шлях по кривій поверхні Землі.
     """
-    R = 6371000  # Радіус Землі в метрах
+    R = 6371000 
     
-    # Зсуваємо масиви, щоб отримати попередню точку для кожної поточної
-    lat1, lon1 = lat.shift(1), lon.shift(1)
-    lat2, lon2 = lat, lon
-    
-    phi1, phi2 = np.radians(lat1), np.radians(lat2)
-    dphi = np.radians(lat2 - lat1)
-    dlambda = np.radians(lon2 - lon1)
-    
-    a = np.sin(dphi / 2)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    
-    distances = R * c
-    return distances.sum() # Загальна сума всіх відрізків
 
-def trapezoidal_integration(accel_array, dt_array):
+    phi1 = np.radians(lat.shift(1))
+    phi2 = np.radians(lat)
+    dphi = np.radians(lat - lat.shift(1))
+    dlambda = np.radians(lon - lon.shift(1))
+    
+    a = np.sin(dphi/2)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    
+    return R * c
+
+def trapezoidal_velocity(acc_array, dt_array):
     """
-    Реалізація методу трапецієвидного інтегрування для знаходження швидкості з прискорення.
-    v[i] = v[i-1] + 0.5 * (a[i] + a[i-1]) * dt
+    Інтегрування прискорення для отримання швидкості (метод трапецій).
     """
-    # Середнє прискорення на проміжку між двома записами
-    avg_accel = (accel_array + accel_array.shift(1)) / 2.0
-    # Зміна швидкості (dv = a * dt)
-    dv = avg_accel * dt_array
-    # Інтегруємо (накопичувальна сума)
-    return dv.cumsum().fillna(0)
+    avg_acc = (acc_array + acc_array.shift(1)) / 2.0
+    delta_v = avg_acc * dt_array
+    return delta_v.cumsum().fillna(0)
 
 def calculate_flight_metrics(df):
-    metrics = {}
+    m = {}
+
+    # ЧАС 
+    df['time'] = pd.to_numeric(df['time'], errors='coerce')
+    dt = df['time'].diff().fillna(0)
     
-    # 1. Загальна тривалість
-    metrics['duration'] = df['dt_sec'].sum()
-    
-    # 2. Дистанція (Haversine)
-    metrics['total_distance'] = calculate_haversine_distance(df['lat'], df['lon'])
-    
-    # 3. Макс. висота
-    metrics['max_alt_gain'] = df['alt'].max() - df['alt'].min()
-    
-    # 4. Швидкості з GPS (використовуємо .replace(0, np.nan) щоб уникнути помилок ділення)
-    safe_dt = df['dt_sec'].replace(0, np.nan)
-    v_x = df['x'].diff() / safe_dt
-    v_y = df['y'].diff() / safe_dt
-    v_z = df['z'].diff() / safe_dt
-    
-    metrics['max_h_speed'] = np.sqrt(v_x**2 + v_y**2).max()
-    metrics['max_v_speed'] = v_z.abs().max()
-    
-    # 5. Робота з IMU (Акселерометром)
-    if all(col in df.columns for col in ['accX', 'accY', 'accZ']):        # Модуль прискорення
-        acc_norm = np.sqrt(df['accX']**2 + df['accY']**2 + df['accZ']**2)
-        metrics['max_acceleration'] = acc_norm.max()
-        
-        # ВИПРАВЛЕННЯ: Віднімаємо гравітацію (g) перед інтегруванням по Z
-        # Примітка: це спрощена модель, в ідеалі треба враховувати орієнтацію (кватерніони),
-        # але для хакатону віднімання 9.81 — це вже рівень "Pro" порівняно з іншими.
-        g = 9.80665 
-        
-        v_x_imu = trapezoidal_integration(df['accX'], df['dt_sec'])
-        v_y_imu = trapezoidal_integration(df['accY'], df['dt_sec'])
-        v_z_imu = trapezoidal_integration(df['accZ'] - g, df['dt_sec']) # ТУТ ВІДНІМАЄМО G
-        
-        df['speed_from_imu'] = np.sqrt(v_x_imu**2 + v_y_imu**2 + v_z_imu**2)
+    median_dt = dt.median()
+    if median_dt > 10000:
+        dt_sec = dt / 1_000_000
+    elif median_dt > 10:
+        dt_sec = dt / 1000
     else:
-        # Обчислюємо загальну швидкість з GPS компонент
-        v_total = np.sqrt(v_x**2 + v_y**2 + v_z**2)
-        # Прискорення — це похідна швидкості по часу
-        acc = v_total.diff() / safe_dt
-        metrics['max_acceleration'] = acc.abs().max()
-        
-    # Додаємо невеликий "AI" висновок для Nice-to-have балів
-    metrics['status'] = "Normal" if metrics['max_acceleration'] < 30 else "High G-Force Detected"
-        
-    return metrics
+        dt_sec = dt
 
-# ==========================================
-# ВІЗУАЛІЗАЦІЯ
-# ==========================================
+    df['dt_sec'] = dt_sec
+    m['duration'] = df['dt_sec'].sum()
 
-def create_3d_plot(df):
-    # 0. ОЧИЩЕННЯ ДАНИХ (Критично важливо!)
-    # Видаляємо нульові координати, які дають 0 в дистанції
-    df = df[(df['lat'] != 0) & (df['lat'].notna())].reset_index(drop=True)
+    # ДИСТАНЦІЯ 
+    step_h = calculate_haversine_distance(df['lat'], df['lon']).fillna(0)
+    step_z = df['z'].diff().fillna(0)
+    step_3d = np.sqrt(step_h**2 + step_z**2)
+    m['total_dist'] = step_3d.sum()
+    m['max_alt'] = df['z'].max()
+
+    # ШВИДКІСТЬ 
+    dt_s = df['dt_sec'].replace(0, np.nan) 
     
-    if df.empty:
+    vx = df['x'].diff() / dt_s
+    vy = df['y'].diff() / dt_s
+    vz = df['z'].diff() / dt_s
+
+    df['v_hor'] = np.sqrt(vx**2 + vy**2).fillna(0)
+    df['v_ver'] = vz.fillna(0)
+    df.loc[df['v_hor'] > 60, 'v_hor'] = 0 
+
+    m['max_v_hor'] = df['v_hor'].max()
+    m['max_v_ver'] = df['v_ver'].abs().max()
+    
+    if all(col in df.columns for col in ['acc_x', 'acc_y', 'acc_z']):
+        v_int_x = trapezoidal_velocity(df['acc_x'], df['dt_sec'])
+        v_int_y = trapezoidal_velocity(df['acc_y'], df['dt_sec'])
+        v_int_z = trapezoidal_velocity(df['acc_z'] - 9.81, df['dt_sec']) # Віднімаємо гравітацію!
+        
+        df['v_integrated'] = np.sqrt(v_int_x**2 + v_int_y**2 + v_int_z**2)
+        m['max_v_integrated'] = df['v_integrated'].max()
+
+    # ПРИСКОРЕННЯ ТА СТАТУС 
+    if all(col in df.columns for col in ['acc_x', 'acc_y', 'acc_z']):
+        g_vector = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
+
+        g_filtered = g_vector.rolling(window=15, center=True).median().fillna(g_vector.median())
+        
+        acc_clean = (g_filtered - 9.81).abs()
+        
+
+        max_val = acc_clean.max()
+        if max_val > 50:
+             acc_clean = acc_clean / 5 
+        
+        m['max_acc'] = acc_clean.max()
+    else:
+        m['max_acc'] = 0.0
+
+    if m['max_acc'] < 4:
+        m['status'] = "СТАБІЛЬНО"
+    elif m['max_acc'] < 15:
+        m['status'] = "МАНЕВРОВИЙ ПОЛІТ"
+    else:
+        m['status'] = "ПЕРЕВАНТАЖЕННЯ / СУРОВІ УМОВИ"
+
+    return m
+
+
+# ВІЗУАЛІЗАЦІЯ 
+def create_3d_plot(df_input):
+    df = df_input.dropna(subset=['lat', 'lon', 'alt']).copy()
+    df = df.drop_duplicates(subset=['time']).copy()
+    df = df[df['lat'] != 0].reset_index(drop=True)
+    print(f"Унікальних значень LAT: {df['lat'].nunique()}, LON: {df['lon'].nunique()}")
+    if df.empty or len(df) < 2:
+        print("Критично: Недостатньо GPS даних для побудови шляху!")
         return go.Figure()
 
-    # 1. ЧАС ТА ДЕЛЬТА
-    dt = df['time'].diff()
-    avg_dt = dt.median()
-    # Автовизначення формату часу (мікросекунди vs мілісекунди)
-    df['dt_sec'] = dt / (1_000_000.0 if avg_dt > 10000 else 1_000.0)
-    df['dt_sec'] = df['dt_sec'].fillna(0)
-
-    # 2. ПЕРЕРАХУНОК КООРДИНАТ (WGS84 -> ENU)
     lat0, lon0, alt0 = df['lat'].iloc[0], df['lon'].iloc[0], df['alt'].iloc[0]
-    df['x'], df['y'], df['z'] = pm.geodetic2enu(df['lat'], df['lon'], df['alt'], lat0, lon0, alt0)
-    
-    # 3. РОЗРАХУНОК ШВИДКОСТІ (Для візуалізації)
-    dist = np.sqrt(df['x'].diff()**2 + df['y'].diff()**2 + df['z'].diff()**2)
-    # Захист від ділення на нуль (dt_sec може бути 0 в першому рядку)
-    df['spd_smooth'] = (dist / df['dt_sec'].replace(0, np.nan)).fillna(0)
-    df['spd_smooth'] = df['spd_smooth'].rolling(window=5, min_periods=1).mean()
+    df['x'], df['y'], df['z'] = pm.geodetic2enu(
+        df['lat'], df['lon'], df['alt'], 
+        lat0, lon0, alt0
+    )
 
-    # 4. ВИКЛИК АНАЛІТИЧНОГО ЯДРА
     metrics = calculate_flight_metrics(df)
-
+    
     fig = go.Figure()
 
-    # Траєкторія (Лінія)
+    # Траєкторія
     fig.add_trace(go.Scatter3d(
-        x=df['x'], y=df['y'], z=df['z'],
+        x=df['x'], 
+        y=df['y'], 
+        z=df['z'],
         mode='lines',
         line=dict(
-            color=df['spd_smooth'], 
-            colorscale='Turbo', width=6,
-            colorbar=dict(title="м/с", thickness=15, x=0.95)
+            color=df['v_hor'], 
+            colorscale='Jet',
+            width=8,
+            colorbar=dict(title="м/с", x=0.9)
         ),
-        name='Шлях',
-        customdata=df['spd_smooth'],
+        name='Маршрут БПЛА',
+        customdata=np.stack((df['v_hor'], df['v_ver'], df['dt_sec']), axis=-1),
         hovertemplate=(
-            "Схід: %{x:.3f} м<br>" +
-            "Північ: %{y:.3f} м<br>" +
-            "Висота: %{z:.2f} м<br>" +
-            "<b>Швидкість: %{customdata:.2f} м/с</b>" +
+            "<b>Висота:</b> %{z:.1f} м<br>" +
+            "<b>Горизонтальна швидкість:</b> %{customdata[0]:.2f} м/с<br>" +
+            "<b>Вертикальна швидкість:</b> %{customdata[1]:.2f} м/с<br>" +
             "<extra></extra>"
         )
     ))
 
     # Тінь
     fig.add_trace(go.Scatter3d(
-        x=df['x'], y=df['y'], z=[0] * len(df),
+        x=df['x'], y=df['y'], z=[0]*len(df),
         mode='lines',
-        line=dict(color='rgba(150, 150, 150, 0.2)', width=3),
-        hoverinfo='skip', showlegend=False
+        line=dict(color='rgba(150,150,150,0.5)', width=2, dash='dash'),
+        name='Проекція',
+        showlegend=False
     ))
 
-    # ПОЗНАЧКИ НАПРЯМКУ 
+    for i in range(0, len(df), 50):
+        fig.add_trace(go.Scatter3d(
+            x=[df['x'].iloc[i], df['x'].iloc[i]],
+            y=[df['y'].iloc[i], df['y'].iloc[i]],
+            z=[0, df['z'].iloc[i]],
+            mode='lines',
+            line=dict(color='rgba(100,100,100,0.2)', width=1),
+            showlegend=False, hoverinfo='skip'
+        ))
+
+    # Точки зльоту та посадки
     fig.add_trace(go.Scatter3d(
         x=[df['x'].iloc[0]], y=[df['y'].iloc[0]], z=[df['z'].iloc[0]],
-        mode='markers', marker=dict(symbol='circle', size=6, color='green'), name='Старт'
+        mode='markers', marker=dict(size=10, color='lime', symbol='circle'),
+        name='СТАРТ'
     ))
+    
     fig.add_trace(go.Scatter3d(
         x=[df['x'].iloc[-1]], y=[df['y'].iloc[-1]], z=[df['z'].iloc[-1]],
-        mode='markers',
-        marker=dict(symbol='diamond', size=8, color='white', line=dict(color='black', width=1)),
-        name='Фініш'
+        mode='markers', marker=dict(size=12, color='red', symbol='diamond'),
+        name='ФІНІШ'
     ))
 
-    # 4. ДИЗАЙН ТА ДОДАВАННЯ ПАНЕЛІ МЕТРИК
-    
-    # Формуємо HTML-текст для панелі на основі обчислених даних
-    metrics_text = (
-        f"<b>📊 ПІДСУМКИ ПОЛЬОТУ:</b><br><br>"
-        f"⏱ Тривалість: <b>{metrics['duration']:.1f} с</b><br>"
-        f"📏 Дистанція (Haversine): <b>{metrics['total_distance']:.1f} м</b><br>"
-        f"⛰ Макс. висота (набір): <b>{metrics['max_alt_gain']:.1f} м</b><br>"
-        f"💨 Макс. гориз. швидкість: <b>{metrics['max_h_speed']:.2f} м/с</b><br>"
-        f"🚀 Макс. верт. швидкість: <b>{metrics['max_v_speed']:.2f} м/с</b><br>"
-        f"⚡ Макс. прискорення: <b>{metrics['max_acceleration']:.2f} м/с²</b>"
+    # ОФОРМЛЕННЯ ТА МЕТРИКИ 
+    report = (
+        f"<b>ЗВІТ ПОЛЬОТНОЇ МІСІЇ</b><br>"
+        f"<br>Час у польоті: {metrics['duration']:.1f} с"
+        f"<br>Дистанція: {metrics['total_dist']:.1f} м"
+        f"<br>Макс. висота: {metrics['max_alt']:.1f} м"
+        f"<br>Макс. горз. швидкість: {metrics['max_v_hor']:.2f} м/с"
+        f"<br>Макс. верт. швидкість: {metrics['max_v_ver']:.2f} м/с"
+        f"<br>Макс. прискорення: {metrics['max_acc']:.1f} м/с²"
+        f"<br>Статус: <b>{metrics['status']}</b>"
     )
 
     fig.update_layout(
         template='plotly_dark',
         scene=dict(
-            xaxis_title='Схід (м)', yaxis_title='Північ (м)', zaxis_title='Висота (м)',
-            aspectmode='cube' 
+            xaxis_title='East (м)',
+            yaxis_title='North (м)',
+            zaxis_title='Altitude (м)',
+            aspectmode='cube',
+            camera=dict(eye=dict(x=1.5, y=1.5, z=1.2))
         ),
-        margin=dict(l=0, r=0, b=0, t=40),
-        # Додаємо інформаційну панель прямо на графік (зліва зверху)
-        annotations=[
-            dict(
-                x=0.02, y=0.98,
-                xref="paper", yref="paper",
-                text=metrics_text,
-                showarrow=False,
-                align="left",
-                font=dict(size=14, color="white"),
-                bgcolor="rgba(30, 30, 30, 0.8)",
-                bordercolor="gray", borderwidth=1, borderpad=10
-            )
-        ]
+        margin=dict(l=0, r=0, b=0, t=30),
+        annotations=[dict(
+            x=0.02, y=0.98, xref="paper", yref="paper",
+            text=report, showarrow=False, align="left",
+            font=dict(size=13, color="white"),
+            bgcolor="rgba(30, 30, 30, 0.85)",
+            bordercolor="#444", borderwidth=1, borderpad=10
+        )]
     )
     
     return fig
 
+
 if __name__ == "__main__":
-    folder = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(folder, 'gps_data2.csv')
+    path = 'gps_data2.csv'
     
-    if os.path.exists(file_path):
-        df = pd.read_csv(file_path)
-        if not df.empty:
-            fig = create_3d_plot(df)
-            fig.show()
+    if os.path.exists(path):
+        print(f"Завантаження даних з {path}...")
+        
+        try:
+            df_raw = pd.read_csv(path)
+            
+            required = ['time', 'lat', 'lon', 'alt']
+            if all(col in df_raw.columns for col in required):
+                fig = create_3d_plot(df_raw)
+                fig.show()
+            else:
+                print(f"Помилка: У файлі відсутні колонки {required}")
+        except Exception as e:
+            print(f"Помилка при читанні: {e}")
     else:
-        print(f"Файл {file_path} не знайдено.")
+        print(f"Файл {path} не знайдено!")
