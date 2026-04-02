@@ -4,11 +4,15 @@ import numpy as np
 import plotly.graph_objects as go
 import pymap3d as pm
 
+MAX_SPEED_THRESHOLD = 60.0  
+GPS_GLITCH_THRESHOLD = 100.0  
+GRAVITY = 9.81
+
 # АНАЛІТИЧНЕ ЯДРО 
 def calculate_haversine_distance(lat, lon):
     """
-    Обчислення відстані Haversine. 
-    Рахує реальний шлях по кривій поверхні Землі.
+    Інтегрування прискорення для отримання швидкості (метод трапецій).
+    Leaky integrator (0.98): гасить накопичення похибки (дрейф) від шуму IMU при інтегруванні.
     """
     R = 6371000 
     
@@ -29,7 +33,10 @@ def trapezoidal_velocity(acc_array, dt_array):
     """
     avg_acc = (acc_array + acc_array.shift(1)) / 2.0
     delta_v = avg_acc * dt_array
-    return delta_v.cumsum().fillna(0)
+    v = [0]
+    for dv in delta_v.fillna(0):
+        v.append((v[-1] + dv) * 0.98)
+    return pd.Series(v[1:])
 
 def calculate_flight_metrics(df):
     m = {}
@@ -51,7 +58,7 @@ def calculate_flight_metrics(df):
 
     # ДИСТАНЦІЯ 
     step_h = calculate_haversine_distance(df['lat'], df['lon']).fillna(0)
-    step_h = step_h.mask(step_h > 100, 0)
+    step_h = step_h.mask(step_h > GPS_GLITCH_THRESHOLD, 0)
     
     step_z = df['z'].diff().fillna(0)
     step_3d = np.sqrt(step_h**2 + step_z**2)
@@ -67,7 +74,7 @@ def calculate_flight_metrics(df):
 
     df['v_hor'] = np.sqrt(vx**2 + vy**2).fillna(0)
     df['v_ver'] = vz.fillna(0)
-    df.loc[df['v_hor'] > 60, 'v_hor'] = 0 
+    df.loc[df['v_hor'] > MAX_SPEED_THRESHOLD, 'v_hor'] = 0 
 
     m['max_v_hor'] = df['v_hor'].max()
     m['max_v_ver'] = df['v_ver'].abs().max()
@@ -75,7 +82,10 @@ def calculate_flight_metrics(df):
     if all(col in df.columns for col in ['acc_x', 'acc_y', 'acc_z']):
         v_int_x = trapezoidal_velocity(df['acc_x'], df['dt_sec'])
         v_int_y = trapezoidal_velocity(df['acc_y'], df['dt_sec'])
-        v_int_z = trapezoidal_velocity(df['acc_z'] - 9.81, df['dt_sec']) # Віднімаємо гравітацію!
+        """
+        Компенсація гравітації: нейтралізує 1g (9.81) по осі Z для розрахунку чистого лінійного прискорення.
+        """
+        v_int_z = trapezoidal_velocity(df['acc_z'] - GRAVITY, df['dt_sec'])
         
         df['v_integrated'] = np.sqrt(v_int_x**2 + v_int_y**2 + v_int_z**2)
         m['max_v_integrated'] = df['v_integrated'].max()
@@ -83,10 +93,12 @@ def calculate_flight_metrics(df):
     # ПРИСКОРЕННЯ ТА СТАТУС 
     if all(col in df.columns for col in ['acc_x', 'acc_y', 'acc_z']):
         g_vector = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
-
+        """
+        Медіанний фільтр (вікно 15): відсікає високочастотні вібрації моторів БПЛА для точної кінематики.
+        """
         g_filtered = g_vector.rolling(window=15, center=True).median().fillna(g_vector.median())
         
-        acc_clean = (g_filtered - 9.81).abs()
+        acc_clean = (g_filtered - GRAVITY).abs()
         
 
         max_val = acc_clean.max()
@@ -189,6 +201,7 @@ def create_3d_plot(df_input):
         f"<br>Макс. висота: {metrics['max_alt']:.1f} м"
         f"<br>Макс. горз. швидкість: {metrics['max_v_hor']:.2f} м/с"
         f"<br>Макс. верт. швидкість: {metrics['max_v_ver']:.2f} м/с"
+        f"<br>Макс. швидкість (IMU): {metrics['max_v_integrated']:.2f} м/с*"
         f"<br>Макс. прискорення: {metrics['max_acc']:.1f} м/с²"
         f"<br>Статус: <b>{metrics['status']}</b>"
     )
@@ -216,7 +229,7 @@ def create_3d_plot(df_input):
 
 
 if __name__ == "__main__":
-    path = 'gps_data2.csv'
+    path = 'gps_data.csv'
     
     if os.path.exists(path):
         print(f"Завантаження даних з {path}...")
