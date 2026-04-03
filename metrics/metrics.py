@@ -68,6 +68,7 @@ def calculate_metrics(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
             omega = np.array(data[['gyro_x', 'gyro_y', 'gyro_z']].iloc[i].values, copy=True)
             # Оновлення кватерніона повороту
             rotation = rotation * R.from_rotvec(omega * data['dt'].iloc[i])
+            rotation = R.from_quat(rotation.as_quat() / np.linalg.norm(rotation.as_quat()))
 
         # Прискорення в системі БПЛА
         acc = np.array(data[['acc_x', 'acc_y', 'acc_z']].iloc[i].values, copy=True)
@@ -96,16 +97,22 @@ def calculate_metrics(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
 
     data['v_imu'] = np.sqrt(vx**2 + vy**2)
 
+   # ---------------------------------------------------------
+    # 5. SENSOR FUSION (Адаптивний комплементарний фільтр)
     # ---------------------------------------------------------
-    # 5. SENSOR FUSION (Комплементарний фільтр)
-    # ---------------------------------------------------------
-    # Ми поєднуємо стабільність GPS (низькі частоти) та чутливість IMU (високі частоти).
-    # alpha = 0.02 мінімізує накопичення помилки інтегрування (Drift).
-    alpha = 0.02
-    data['fused_speed'] = (1 - alpha) * data['v_gps'] + alpha * data['v_imu']
+    # Розраховуємо коефіцієнт довіри до швидкості GPS (від 0 до 1)
+    # Якщо швидкість низька (дрон тупить/висить) — довіра до GPS падає.
+    speed_conf = data['v_gps'].clip(0, 20) / 20 
+    
+    # Адаптивна альфа: базова 0.02 + надбавка залежно від швидкості
+    # Це дозволяє динамічно змінювати вагу IMU в розрахунках
+    data['alpha_dyn'] = 0.02 + 0.05 * speed_conf
+    
+    # Виконуємо змішування (Fusion)
+    data['fused_speed'] = (1 - data['alpha_dyn']) * data['v_gps'] + data['alpha_dyn'] * data['v_imu']
+    
     # Згладжування ковзним вікном для фільтрації високочастотного шуму
     data['fused_speed'] = data['fused_speed'].rolling(window=5, min_periods=1).mean()
-
     # ---------------------------------------------------------
     # 6. ВЕРТИКАЛЬНА АНАЛІТИКА ТА ВИСОТА
     # ---------------------------------------------------------
