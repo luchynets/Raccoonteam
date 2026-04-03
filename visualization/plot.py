@@ -1,130 +1,18 @@
-import os
 import pandas as pd
 import numpy as np
+import os
+import sys
 import plotly.graph_objects as go
 import pymap3d as pm
 
-MAX_SPEED_THRESHOLD = 60.0  
-GPS_GLITCH_THRESHOLD = 100.0  
-GRAVITY = 9.81
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from metrics.metrics import calculate_metrics
 
-# АНАЛІТИЧНЕ ЯДРО 
-def calculate_haversine_distance(lat, lon):
-    """
-    Інтегрування прискорення для отримання швидкості (метод трапецій).
-    Leaky integrator (0.98): гасить накопичення похибки (дрейф) від шуму IMU при інтегруванні.
-    """
-    R = 6371000 
-    
-
-    phi1 = np.radians(lat.shift(1))
-    phi2 = np.radians(lat)
-    dphi = np.radians(lat - lat.shift(1))
-    dlambda = np.radians(lon - lon.shift(1))
-    
-    a = np.sin(dphi/2)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda/2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
-    
-    return R * c
-
-def trapezoidal_velocity(acc_array, dt_array):
-    """
-    Інтегрування прискорення для отримання швидкості (метод трапецій).
-    """
-    avg_acc = (acc_array + acc_array.shift(1)) / 2.0
-    delta_v = avg_acc * dt_array
-    v = [0]
-    for dv in delta_v.fillna(0):
-        v.append((v[-1] + dv) * 0.98)
-    return pd.Series(v[1:])
-
-def calculate_flight_metrics(df):
-    m = {}
-
-    # ЧАС 
-    df['time'] = pd.to_numeric(df['time'], errors='coerce')
-    dt = df['time'].diff().fillna(0)
-    
-    median_dt = dt.median()
-    if median_dt > 10000:
-        dt_sec = dt / 1_000_000
-    elif median_dt > 10:
-        dt_sec = dt / 1000
-    else:
-        dt_sec = dt
-
-    df['dt_sec'] = dt_sec
-    m['duration'] = df['dt_sec'].sum()
-
-    # ДИСТАНЦІЯ 
-    step_h = calculate_haversine_distance(df['lat'], df['lon']).fillna(0)
-    step_h = step_h.mask(step_h > GPS_GLITCH_THRESHOLD, 0)
-    
-    step_z = df['z'].diff().fillna(0)
-    step_3d = np.sqrt(step_h**2 + step_z**2)
-    m['total_dist'] = step_3d.sum()
-    m['max_alt'] = df['z'].max()
-
-    # ШВИДКІСТЬ 
-    dt_s = df['dt_sec'].replace(0, np.nan) 
-    
-    vx = df['x'].diff() / dt_s
-    vy = df['y'].diff() / dt_s
-    vz = df['z'].diff() / dt_s
-
-    df['v_hor'] = np.sqrt(vx**2 + vy**2).fillna(0)
-    df['v_ver'] = vz.fillna(0)
-    df.loc[df['v_hor'] > MAX_SPEED_THRESHOLD, 'v_hor'] = 0 
-
-    m['max_v_hor'] = df['v_hor'].max()
-    m['max_v_ver'] = df['v_ver'].abs().max()
-    
-    if all(col in df.columns for col in ['acc_x', 'acc_y', 'acc_z']):
-        v_int_x = trapezoidal_velocity(df['acc_x'], df['dt_sec'])
-        v_int_y = trapezoidal_velocity(df['acc_y'], df['dt_sec'])
-        """
-        Компенсація гравітації: нейтралізує 1g (9.81) по осі Z для розрахунку чистого лінійного прискорення.
-        """
-        v_int_z = trapezoidal_velocity(df['acc_z'] - GRAVITY, df['dt_sec'])
-        
-        df['v_integrated'] = np.sqrt(v_int_x**2 + v_int_y**2 + v_int_z**2)
-        m['max_v_integrated'] = df['v_integrated'].max()
-
-    # ПРИСКОРЕННЯ ТА СТАТУС 
-    if all(col in df.columns for col in ['acc_x', 'acc_y', 'acc_z']):
-        g_vector = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
-        """
-        Медіанний фільтр (вікно 15): відсікає високочастотні вібрації моторів БПЛА для точної кінематики.
-        """
-        g_filtered = g_vector.rolling(window=15, center=True).median().fillna(g_vector.median())
-        
-        acc_clean = (g_filtered - GRAVITY).abs()
-        
-
-        max_val = acc_clean.max()
-        if max_val > 50:
-             acc_clean = acc_clean / 5 
-        
-        m['max_acc'] = acc_clean.max()
-    else:
-        m['max_acc'] = 0.0
-
-    if m['max_acc'] < 4:
-        m['status'] = "СТАБІЛЬНО"
-    elif m['max_acc'] < 15:
-        m['status'] = "МАНЕВРОВИЙ ПОЛІТ"
-    else:
-        m['status'] = "ПЕРЕВАНТАЖЕННЯ / СУРОВІ УМОВИ"
-
-    return m
-
-
-# ВІЗУАЛІЗАЦІЯ 
-def create_3d_plot(df_input):
-    df = df_input.dropna(subset=['lat', 'lon', 'alt']).copy()
-    df = df.drop_duplicates(subset=['time']).copy()
+# Функція побудови графіка 
+def create_3d_plot(df, metrics):
+    # Очищуємо дані, якщо є нульові координати
     df = df[df['lat'] != 0].reset_index(drop=True)
-    print(f"Унікальних значень LAT: {df['lat'].nunique()}, LON: {df['lon'].nunique()}")
+    
     if df.empty or len(df) < 2:
         print("Критично: Недостатньо GPS даних для побудови шляху!")
         return go.Figure()
@@ -135,7 +23,8 @@ def create_3d_plot(df_input):
         lat0, lon0, alt0
     )
 
-    metrics = calculate_flight_metrics(df)
+    # Знаходимо найнижчу точку для правильної тіні
+    z_floor = df['z'].min()
     
     fig = go.Figure()
 
@@ -146,64 +35,66 @@ def create_3d_plot(df_input):
         z=df['z'],
         mode='lines',
         line=dict(
-            color=df['v_hor'], 
+            color=df['fused_speed'].values,
             colorscale='Jet',
+            cmin=df['fused_speed'].min(),
+            cmax=df['fused_speed'].max(),
             width=8,
             colorbar=dict(title="м/с", x=0.9)
         ),
         name='Маршрут БПЛА',
-        customdata=np.stack((df['v_hor'], df['v_ver'], df['dt_sec']), axis=-1),
+        customdata=np.stack((df['fused_speed'], df['fused_vz'], df['dt']), axis=-1),
         hovertemplate=(
             "<b>Висота:</b> %{z:.1f} м<br>" +
-            "<b>Горизонтальна швидкість:</b> %{customdata[0]:.2f} м/с<br>" +
-            "<b>Вертикальна швидкість:</b> %{customdata[1]:.2f} м/с<br>" +
+            "<b>Гор. швидкість:</b> %{customdata[0]:.2f} м/с<br>" +
+            "<b>Верт. швидкість:</b> %{customdata[1]:.2f} м/с<br>" +
             "<extra></extra>"
         )
     ))
 
     # Тінь
     fig.add_trace(go.Scatter3d(
-        x=df['x'], y=df['y'], z=[0]*len(df),
+        x=df['x'], y=df['y'], z=[z_floor]*len(df),
         mode='lines',
         line=dict(color='rgba(150,150,150,0.5)', width=2, dash='dash'),
         name='Проекція',
         showlegend=False
     ))
 
+    # Вертикальні лінії від тіні до траєкторії
     for i in range(0, len(df), 50):
         fig.add_trace(go.Scatter3d(
             x=[df['x'].iloc[i], df['x'].iloc[i]],
             y=[df['y'].iloc[i], df['y'].iloc[i]],
-            z=[0, df['z'].iloc[i]],
+            z=[z_floor, df['z'].iloc[i]],
             mode='lines',
             line=dict(color='rgba(100,100,100,0.2)', width=1),
             showlegend=False, hoverinfo='skip'
         ))
 
-    # Точки зльоту та посадки
+    # Точка зльоту
     fig.add_trace(go.Scatter3d(
         x=[df['x'].iloc[0]], y=[df['y'].iloc[0]], z=[df['z'].iloc[0]],
         mode='markers', marker=dict(size=10, color='lime', symbol='circle'),
         name='СТАРТ'
     ))
     
+    # Точка посадки
     fig.add_trace(go.Scatter3d(
         x=[df['x'].iloc[-1]], y=[df['y'].iloc[-1]], z=[df['z'].iloc[-1]],
         mode='markers', marker=dict(size=12, color='red', symbol='diamond'),
         name='ФІНІШ'
     ))
 
-    # ОФОРМЛЕННЯ ТА МЕТРИКИ 
+    # Метрики
     report = (
         f"<b>ЗВІТ ПОЛЬОТНОЇ МІСІЇ</b><br>"
-        f"<br>Час у польоті: {metrics['duration']:.1f} с"
-        f"<br>Дистанція: {metrics['total_dist']:.1f} м"
-        f"<br>Макс. висота: {metrics['max_alt']:.1f} м"
-        f"<br>Макс. горз. швидкість: {metrics['max_v_hor']:.2f} м/с"
-        f"<br>Макс. верт. швидкість: {metrics['max_v_ver']:.2f} м/с"
-        f"<br>Макс. швидкість (IMU): {metrics['max_v_integrated']:.2f} м/с*"
-        f"<br>Макс. прискорення: {metrics['max_acc']:.1f} м/с²"
-        f"<br>Статус: <b>{metrics['status']}</b>"
+        f"<br>Час у польоті: {metrics.get('flight_duration', 0):.1f} с"
+        f"<br>Дистанція: {metrics.get('total_distance', 0):.1f} м"
+        f"<br>Набір висоти: {metrics.get('max_altitude_gain', 0):.1f} м"
+        f"<br>Макс. горз. швидкість: {metrics.get('max_horizontal_speed', 0):.2f} м/с"
+        f"<br>Макс. верт. швидкість: {metrics.get('max_vertical_speed', 0):.2f} м/с"
+        f"<br>Макс. прискорення: {metrics.get('max_acceleration', 0):.1f} м/с²"
     )
 
     fig.update_layout(
@@ -227,23 +118,35 @@ def create_3d_plot(df_input):
     
     return fig
 
+# Запуск
+def main():
+    # 1. Знаходимо файл (це залишається, бо нам треба звідкись брати сирі дані)
+    csv_path = os.path.join("parser", "merged_output_01.csv")
+    
+    if not os.path.exists(csv_path):
+        print(f"Помилка: Файл {csv_path} не знайдено!")
+        return
+
+    # 2. Читаємо СИРІ дані
+    print(f"Зчитування даних з {csv_path}...")
+    df_raw = pd.read_csv(csv_path)
+
+    # 3. Віддаємо сирі дані в твоє ядро навігації!
+    print("Обчислення метрик та Sensor Fusion...")
+    metrics_result, processed_data = calculate_metrics(df_raw)
+
+    # Збереження файлу (в основній гілці видалити)
+    output_path = "processed_data_check1.csv"
+    processed_data.to_csv(output_path, index=False)
+    print(f"Оновлені дані успішно збережено у файл: {output_path}")
+    # ----------------------------------
+    
+    # 4. Передаємо ПРОКАЧАНИЙ датафрейм (processed_data) у графік
+    print("Побудова 3D графіка...")
+    fig = create_3d_plot(processed_data, metrics_result)
+    
+    # Показуємо результат
+    fig.show()
 
 if __name__ == "__main__":
-    path = 'gps_data.csv'
-    
-    if os.path.exists(path):
-        print(f"Завантаження даних з {path}...")
-        
-        try:
-            df_raw = pd.read_csv(path)
-            
-            required = ['time', 'lat', 'lon', 'alt']
-            if all(col in df_raw.columns for col in required):
-                fig = create_3d_plot(df_raw)
-                fig.show()
-            else:
-                print(f"Помилка: У файлі відсутні колонки {required}")
-        except Exception as e:
-            print(f"Помилка при читанні: {e}")
-    else:
-        print(f"Файл {path} не знайдено!")
+    main()
