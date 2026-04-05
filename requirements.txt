@@ -8,6 +8,7 @@ click==8.3.2
 fastcrc==0.3.5
 gitdb==4.0.12
 GitPython==3.1.46
+haversine==2.9.0
 idna==3.11
 Jinja2==3.1.6
 jsonschema==4.26.0
@@ -29,6 +30,7 @@ python-dateutil==2.9.0.post0
 referencing==0.37.0
 requests==2.33.1
 rpds-py==0.30.0
+scipy==1.17.1
 six==1.17.0
 smmap==5.0.3
 streamlit==1.56.0
