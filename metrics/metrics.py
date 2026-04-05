@@ -104,17 +104,27 @@ def calculate_metrics(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     data['fused_speed'] = (1 - alpha) * data['v_gps'] + alpha * data['v_imu']
     data['fused_speed'] = data['fused_speed'].rolling(5, min_periods=1).mean()
 
-    # --- 6. ВЕРТИКАЛЬНА АНАЛІТИКА ТА SENSOR FUSION ---
+    # --- 6. ВЕРТИКАЛЬНА АНАЛІТИКА ТА ADAPTIVE SENSOR FUSION ---
     v_imu_z = dv_z.cumsum()
 
-    # 2. GPS-складова (фільтрована дельта висоти)
+    # GPS-складова (фільтрована дельта висоти)
     alt_smooth = data['alt'].rolling(window=10, min_periods=1, center=True).median()
     data['delta_alt'] = alt_smooth.diff().fillna(0)
 
-    # 3. Швидкість по GPS (dz/dt) з обмеженням шумів
+    # Швидкість по GPS (dz/dt) з обмеженням шумів
     v_gps_z = (data['delta_alt'] / (data['dt'] + 1e-6)).fillna(0).clip(-20, 20)
 
-    alpha_z = 0.05
+    # ADAPTIVE vertical fusion:
+    # GPS altitude is noisy, but IMU drifts vertically over time.
+    # We trust IMU MORE during high vertical acceleration (climbs/dives),
+    # and trust GPS MORE during stable flight (low vertical acceleration).
+    # 
+    # Strategy: Alpha increases with vertical acceleration magnitude
+    vertical_accel = data['az_w'].abs()
+    # High trust in IMU (alpha=0.15) during aggressive climbs/dives
+    # Low trust in IMU (alpha=0.03) during stable flight
+    alpha_z = 0.03 + 0.12 * (vertical_accel.clip(0, 10) / 10)
+    
     data['fused_vz'] = (1 - alpha_z) * v_gps_z + alpha_z * v_imu_z
     data['fused_vz'] = data['fused_vz'].rolling(window=5, min_periods=1).mean()
 
