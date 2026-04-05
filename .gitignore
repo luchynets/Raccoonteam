@@ -13,3 +13,4 @@ dist/
 downloads/
 logs
 data/
+.DS_Store
